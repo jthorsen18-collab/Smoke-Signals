@@ -1,0 +1,508 @@
+/*
+  Maskwa Connect Power Sender A - Rev.40
+
+  Hardware:
+    ESP32-S3-WROOM main controller
+    EBYTE E22P-915MBH-SC external LoRa board over UART
+    ADS1115 at 0x49 for YC500EKB51 current clamp
+    ADS1115 at 0x48 for LEM DVC1000-P voltage transducer
+    Waveshare UPS Module 3S power system
+
+  Radio:
+    ESP32 GPIO15 TX -> EBYTE RXD
+    ESP32 GPIO16 RX -> EBYTE TXD
+
+  I2C:
+    SDA = GPIO8
+    SCL = GPIO9
+
+  Receiver timing packet:
+    T,<epoch_ms>
+
+  Packets transmitted only during Node A timed slot:
+    P,A,RUN,<volts>,<amps>
+    P,A,MODE,<AC/DC>,<volts>,<amps>
+*/
+
+#include <Arduino.h>
+#include <Wire.h>
+#include <Adafruit_ADS1X15.h>
+#include <math.h>
+
+// ----------------------- Rev / node identity -----------------------
+
+const char REV_NUMBER[] = "Rev.40";
+const char NODE_ID[] = "A";
+
+// ----------------------- I2C / ADS configuration -----------------------
+
+const int I2C_SDA_PIN = 8;
+const int I2C_SCL_PIN = 9;
+
+const uint8_t ADS_VOLT_ADDR = 0x48;
+const uint8_t ADS_AMP_ADDR = 0x49;
+
+const uint8_t ADS_VOLT_CHANNEL = 0;
+const uint8_t ADS_AMP_CHANNEL = 0;
+
+Adafruit_ADS1115 adsAmp;
+Adafruit_ADS1115 adsVolt;
+
+bool adsAmpReady = false;
+bool adsVoltReady = false;
+
+// ADS1115 GAIN_ONE = +/-4.096 V, 0.125 mV per count.
+const float ADS_VOLTS_PER_COUNT = 0.000125f;
+
+// ----------------------- EBYTE UART configuration -----------------------
+
+#define RADIO_SERIAL Serial1
+
+const int RADIO_TX_PIN = 15;
+const int RADIO_RX_PIN = 16;
+const uint32_t RADIO_BAUD = 9600;
+
+// ----------------------- Timed-slot configuration -----------------------
+
+const uint32_t SLOT_EPOCH_MS = 1000;
+const uint32_t NODE_A_SLOT_MS = 250;
+const uint32_t SLOT_WINDOW_MS = 90;
+const uint32_t TIMING_TIMEOUT_MS = 5000;
+
+// ----------------------- Non-blocking intervals -----------------------
+
+const uint32_t SENSE_INTERVAL_MS = 200;
+const uint32_t HEARTBEAT_INTERVAL_MS = 1800;
+
+// ----------------------- Sampling configuration -----------------------
+
+const uint16_t SAMPLE_COUNT = 48;
+const uint16_t SAMPLE_SPACING_US = 1000;
+
+// ----------------------- Calibration -----------------------
+
+const float YC500_RAW_CENTER_VOLTS = 2.5f;
+const float YC500_ADS_TO_RAW_SCALE = 1.1f;
+const float YC500_AMPS_PER_RAW_VOLT = 500.0f;
+
+const float LEM_RAW_CENTER_VOLTS = 2.5f;
+const float LEM_ADS_TO_RAW_SCALE = 2.0f;
+const float LEM_WELDING_VOLTS_PER_RAW_VOLT = 750.0f;
+
+const float VOLTS_NOISE_FLOOR = 1.0f;
+const float AMPS_NOISE_FLOOR = 1.0f;
+
+const float AC_DETECT_VOLTS_MIN = 5.0f;
+const float AC_DETECT_AMPS_MIN = 5.0f;
+const float AC_TO_DC_RATIO = 0.35f;
+
+// ----------------------- Runtime state -----------------------
+
+struct SignalStats {
+  float mean;
+  float rmsAc;
+};
+
+struct Measurement {
+  float dcVolts;
+  float acVolts;
+  float dcAmps;
+  float acAmps;
+  float sendVolts;
+  float sendAmps;
+  bool acMode;
+  bool valid;
+};
+
+Measurement latest = {
+  0.0f, 0.0f,
+  0.0f, 0.0f,
+  0.0f, 0.0f,
+  false,
+  false
+};
+
+uint32_t lastSenseMs = 0;
+uint32_t lastHeartbeatMs = 0;
+
+uint32_t lastTimingBeaconMs = 0;
+uint32_t timingLocalAnchorMs = 0;
+uint32_t timingRemoteAnchorMs = 0;
+uint32_t lastTxEpochIndex = UINT32_MAX;
+
+String radioLine;
+
+// ----------------------- Utility -----------------------
+
+float applyDeadband(float value, float floorValue) {
+  if (fabs(value) < floorValue) {
+    return 0.0f;
+  }
+  return value;
+}
+
+float adsCountsToVolts(int16_t counts) {
+  return (float)counts * ADS_VOLTS_PER_COUNT;
+}
+
+float readAdsVolts(Adafruit_ADS1115 &ads, uint8_t channel) {
+  return adsCountsToVolts(ads.readADC_SingleEnded(channel));
+}
+
+float ampAdsVoltsToAmps(float adsAmpVolts) {
+  return ((adsAmpVolts * YC500_ADS_TO_RAW_SCALE) - YC500_RAW_CENTER_VOLTS) * YC500_AMPS_PER_RAW_VOLT;
+}
+
+float voltAdsVoltsToWeldingVolts(float adsVoltVolts) {
+  return ((adsVoltVolts * LEM_ADS_TO_RAW_SCALE) - LEM_RAW_CENTER_VOLTS) * LEM_WELDING_VOLTS_PER_RAW_VOLT;
+}
+
+SignalStats calculateStats(float samples[], uint16_t count) {
+  SignalStats stats;
+  stats.mean = 0.0f;
+  stats.rmsAc = 0.0f;
+
+  if (count == 0) {
+    return stats;
+  }
+
+  double sum = 0.0;
+  for (uint16_t i = 0; i < count; i++) {
+    sum += samples[i];
+  }
+
+  stats.mean = (float)(sum / count);
+
+  double sumSquares = 0.0;
+  for (uint16_t i = 0; i < count; i++) {
+    double centered = (double)samples[i] - stats.mean;
+    sumSquares += centered * centered;
+  }
+
+  stats.rmsAc = (float)sqrt(sumSquares / count);
+  return stats;
+}
+
+// ----------------------- Receiver timing -----------------------
+
+String readRadioLine() {
+  while (RADIO_SERIAL.available() > 0) {
+    char c = (char)RADIO_SERIAL.read();
+
+    if (c == '\r') {
+      continue;
+    }
+
+    if (c == '\n') {
+      String finished = radioLine;
+      radioLine = "";
+      finished.trim();
+      return finished;
+    }
+
+    if (radioLine.length() < 96) {
+      radioLine += c;
+    } else {
+      radioLine = "";
+    }
+  }
+
+  return "";
+}
+
+bool parseTimingBeacon(const String &line, uint32_t &remoteEpochMs) {
+  if (!line.startsWith("T,")) {
+    return false;
+  }
+
+  String value = line.substring(2);
+  value.trim();
+
+  if (value.length() == 0) {
+    return false;
+  }
+
+  for (uint16_t i = 0; i < value.length(); i++) {
+    if (!isDigit(value[i])) {
+      return false;
+    }
+  }
+
+  remoteEpochMs = (uint32_t)value.toInt();
+  return true;
+}
+
+void handleReceiverTiming() {
+  String line = readRadioLine();
+
+  if (line.length() == 0) {
+    return;
+  }
+
+  Serial.print("UART RX: ");
+  Serial.println(line);
+
+  uint32_t remoteEpochMs = 0;
+  if (parseTimingBeacon(line, remoteEpochMs)) {
+    timingRemoteAnchorMs = remoteEpochMs;
+    timingLocalAnchorMs = millis();
+    lastTimingBeaconMs = timingLocalAnchorMs;
+  }
+}
+
+bool timingIsSynced() {
+  return lastTimingBeaconMs != 0 && (millis() - lastTimingBeaconMs) <= TIMING_TIMEOUT_MS;
+}
+
+uint32_t networkNowMs() {
+  if (timingIsSynced()) {
+    return timingRemoteAnchorMs + (millis() - timingLocalAnchorMs);
+  }
+
+  return millis();
+}
+
+uint32_t currentEpochIndex() {
+  return networkNowMs() / SLOT_EPOCH_MS;
+}
+
+uint32_t currentEpochOffsetMs() {
+  return networkNowMs() % SLOT_EPOCH_MS;
+}
+
+bool transmitGateOpen() {
+  uint32_t offset = currentEpochOffsetMs();
+  return offset >= NODE_A_SLOT_MS && offset < (NODE_A_SLOT_MS + SLOT_WINDOW_MS);
+}
+
+// ----------------------- Sensing -----------------------
+
+Measurement readMeasurement() {
+  Measurement m;
+  m.dcVolts = 0.0f;
+  m.acVolts = 0.0f;
+  m.dcAmps = 0.0f;
+  m.acAmps = 0.0f;
+  m.sendVolts = 0.0f;
+  m.sendAmps = 0.0f;
+  m.acMode = false;
+  m.valid = adsAmpReady && adsVoltReady;
+
+  if (!m.valid) {
+    return m;
+  }
+
+  float voltSamples[SAMPLE_COUNT];
+  float ampSamples[SAMPLE_COUNT];
+
+  for (uint16_t i = 0; i < SAMPLE_COUNT; i++) {
+    float adsVoltVolts = readAdsVolts(adsVolt, ADS_VOLT_CHANNEL);
+    float adsAmpVolts = readAdsVolts(adsAmp, ADS_AMP_CHANNEL);
+
+    voltSamples[i] = voltAdsVoltsToWeldingVolts(adsVoltVolts);
+    ampSamples[i] = ampAdsVoltsToAmps(adsAmpVolts);
+
+    delayMicroseconds(SAMPLE_SPACING_US);
+  }
+
+  SignalStats voltStats = calculateStats(voltSamples, SAMPLE_COUNT);
+  SignalStats ampStats = calculateStats(ampSamples, SAMPLE_COUNT);
+
+  m.dcVolts = applyDeadband(voltStats.mean, VOLTS_NOISE_FLOOR);
+  m.acVolts = applyDeadband(voltStats.rmsAc, VOLTS_NOISE_FLOOR);
+  m.dcAmps = applyDeadband(ampStats.mean, AMPS_NOISE_FLOOR);
+  m.acAmps = applyDeadband(ampStats.rmsAc, AMPS_NOISE_FLOOR);
+
+  bool voltsLookAc = m.acVolts >= AC_DETECT_VOLTS_MIN && m.acVolts > (fabs(m.dcVolts) * AC_TO_DC_RATIO);
+  bool ampsLookAc = m.acAmps >= AC_DETECT_AMPS_MIN && m.acAmps > (fabs(m.dcAmps) * AC_TO_DC_RATIO);
+
+  m.acMode = voltsLookAc || ampsLookAc;
+
+  if (m.acMode) {
+    m.sendVolts = m.acVolts;
+    m.sendAmps = m.acAmps;
+  } else {
+    m.sendVolts = m.dcVolts;
+    m.sendAmps = m.dcAmps;
+  }
+
+  return m;
+}
+
+void maybeSense() {
+  uint32_t now = millis();
+
+  if (now - lastSenseMs < SENSE_INTERVAL_MS) {
+    return;
+  }
+
+  lastSenseMs = now;
+  latest = readMeasurement();
+}
+
+// ----------------------- Packet transmission -----------------------
+
+void radioPrintln(const String &line) {
+  RADIO_SERIAL.println(line);
+  RADIO_SERIAL.flush();
+}
+
+String legacyRunPacket(const Measurement &m) {
+  String packet = "P,A,RUN,";
+  packet += String(m.sendVolts, 2);
+  packet += ",";
+  packet += String(m.sendAmps, 2);
+  return packet;
+}
+
+String modePacket(const Measurement &m) {
+  String packet = "P,A,MODE,";
+  if (m.acMode) {
+    packet += "AC";
+  } else {
+    packet += "DC";
+  }
+  packet += ",";
+  packet += String(m.sendVolts, 2);
+  packet += ",";
+  packet += String(m.sendAmps, 2);
+  return packet;
+}
+
+void maybeTransmit() {
+  if (!latest.valid) {
+    return;
+  }
+
+  if (!transmitGateOpen()) {
+    return;
+  }
+
+  uint32_t epoch = currentEpochIndex();
+
+  if (lastTxEpochIndex == epoch) {
+    return;
+  }
+
+  String runPacket = legacyRunPacket(latest);
+  String acDcPacket = modePacket(latest);
+
+  radioPrintln(runPacket);
+  delay(8);
+  radioPrintln(acDcPacket);
+
+  Serial.print("TX ");
+  Serial.println(runPacket);
+  Serial.print("TX ");
+  Serial.println(acDcPacket);
+
+  lastTxEpochIndex = epoch;
+}
+
+// ----------------------- Debug heartbeat -----------------------
+
+void printBootDebug() {
+  Serial.println();
+  Serial.println("Maskwa Connect Power Sender A");
+  Serial.println("Rev.40");
+
+  Serial.print("ADS 0x48 status: ");
+  Serial.println(adsVoltReady ? "OK" : "MISSING");
+
+  Serial.print("ADS 0x49 status: ");
+  Serial.println(adsAmpReady ? "OK" : "MISSING");
+
+  Serial.println("I2C pins: SDA GPIO8 / SCL GPIO9");
+  Serial.println("UART pins: TX GPIO15 / RX GPIO16");
+  Serial.println("Timed-slot active");
+  Serial.println("AC/DC auto active");
+  Serial.println();
+}
+
+void maybeHeartbeat() {
+  uint32_t now = millis();
+
+  if (now - lastHeartbeatMs < HEARTBEAT_INTERVAL_MS) {
+    return;
+  }
+
+  lastHeartbeatMs = now;
+
+  Serial.print("HB mode=");
+  Serial.print(latest.acMode ? "AC" : "DC");
+
+  Serial.print(" sendVolts=");
+  Serial.print(latest.sendVolts, 2);
+
+  Serial.print(" sendAmps=");
+  Serial.print(latest.sendAmps, 2);
+
+  Serial.print(" dcVolts=");
+  Serial.print(latest.dcVolts, 2);
+
+  Serial.print(" acVolts=");
+  Serial.print(latest.acVolts, 2);
+
+  Serial.print(" dcAmps=");
+  Serial.print(latest.dcAmps, 2);
+
+  Serial.print(" acAmps=");
+  Serial.print(latest.acAmps, 2);
+
+  Serial.print(" timing=");
+  Serial.print(timingIsSynced() ? "SYNCED" : "LOCAL");
+
+  Serial.print(" window=");
+  Serial.print(transmitGateOpen() ? "OPEN" : "CLOSED");
+
+  Serial.print(" epoch=");
+  Serial.print(currentEpochIndex());
+
+  Serial.print(" offset_ms=");
+  Serial.print(currentEpochOffsetMs());
+
+  Serial.print(" ADS0x48=");
+  Serial.print(adsVoltReady ? "OK" : "MISSING");
+
+  Serial.print(" ADS0x49=");
+  Serial.println(adsAmpReady ? "OK" : "MISSING");
+}
+
+// ----------------------- Setup / loop -----------------------
+
+void setupAds() {
+  adsVoltReady = adsVolt.begin(ADS_VOLT_ADDR);
+  adsAmpReady = adsAmp.begin(ADS_AMP_ADDR);
+
+  if (adsVoltReady) {
+    adsVolt.setGain(GAIN_ONE);
+    adsVolt.setDataRate(RATE_ADS1115_860SPS);
+  }
+
+  if (adsAmpReady) {
+    adsAmp.setGain(GAIN_ONE);
+    adsAmp.setDataRate(RATE_ADS1115_860SPS);
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(300);
+
+  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+
+  RADIO_SERIAL.begin(RADIO_BAUD, SERIAL_8N1, RADIO_RX_PIN, RADIO_TX_PIN);
+
+  setupAds();
+  printBootDebug();
+
+  lastSenseMs = millis() - SENSE_INTERVAL_MS;
+  lastHeartbeatMs = millis() - HEARTBEAT_INTERVAL_MS;
+}
+
+void loop() {
+  handleReceiverTiming();
+  maybeSense();
+  maybeTransmit();
+  maybeHeartbeat();
+}
