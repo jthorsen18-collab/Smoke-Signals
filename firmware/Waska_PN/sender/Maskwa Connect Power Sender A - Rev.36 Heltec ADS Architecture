@@ -1,5 +1,5 @@
 /*
-  Maskwa Connect Power Sender A - Rev.36 Heltec ADS Architecture
+  Power_Sender_A-Rev.36_Heltec_ADS_Architecture
   Rev36 diagnostic version with internal I2C scan before ADS init.
 
   Confirmed hardware:
