@@ -1,0 +1,546 @@
+/*
+  Maskwa Connect Power Sender A - Rev.36 Heltec ADS Architecture
+  Rev36 diagnostic version with internal I2C scan before ADS init.
+
+  Confirmed hardware:
+  GPIO41 = SDA
+  GPIO42 = SCL
+  Voltage ADS = 0x48
+  Amp ADS = 0x49
+*/
+
+#include <Arduino.h>
+#include <SPI.h>
+#include <Wire.h>
+#include <RadioLib.h>
+#include <U8g2lib.h>
+#include <Adafruit_ADS1X15.h>
+#include <math.h>
+
+// ----------------------- Revision / node -----------------------
+
+const char REV_NUMBER[] = "Rev.36";
+const char NODE_ID[] = "A";
+
+// ----------------------- Heltec OLED pins -----------------------
+
+const int PIN_VEXT      = 36;
+const int PIN_OLED_SDA  = 17;
+const int PIN_OLED_SCL  = 18;
+const int PIN_OLED_RST  = 21;
+
+U8G2_SSD1306_128X64_NONAME_F_SW_I2C u8g2(
+  U8G2_R0,
+  PIN_OLED_SCL,
+  PIN_OLED_SDA,
+  U8X8_PIN_NONE
+);
+
+// ----------------------- Heltec onboard LoRa pins -----------------------
+
+const int LORA_NSS   = 8;
+const int LORA_SCK   = 9;
+const int LORA_MOSI  = 10;
+const int LORA_MISO  = 11;
+const int LORA_RST   = 12;
+const int LORA_BUSY  = 13;
+const int LORA_DIO1  = 14;
+
+SX1262 lora = SX1262(new Module(LORA_NSS, LORA_DIO1, LORA_RST, LORA_BUSY));
+bool loraOK = false;
+
+// ----------------------- ADS1115 I2C configuration -----------------------
+
+const int I2C_SDA_PIN = 41;
+const int I2C_SCL_PIN = 42;
+
+const uint8_t ADS_VOLT_ADDR = 0x48;
+const uint8_t ADS_AMP_ADDR  = 0x49;
+
+const uint8_t ADS_VOLT_CHANNEL = 0;
+const uint8_t ADS_AMP_CHANNEL  = 0;
+
+Adafruit_ADS1115 adsVolt;
+Adafruit_ADS1115 adsAmp;
+
+bool adsVoltReady = false;
+bool adsAmpReady  = false;
+
+// ADS1115 GAIN_ONE = +/-4.096 V, 0.125 mV/count
+const float ADS_VOLTS_PER_COUNT = 0.000125f;
+
+// ----------------------- Sampling -----------------------
+
+const uint16_t SAMPLE_COUNT = 48;
+const uint16_t SAMPLE_SPACING_US = 1000;
+
+const uint32_t SENSE_INTERVAL_MS = 200;
+const uint32_t OLED_INTERVAL_MS = 250;
+const uint32_t HEARTBEAT_INTERVAL_MS = 1800;
+
+// ----------------------- Calibration -----------------------
+
+const float YC500_RAW_CENTER_VOLTS = 2.5f;
+const float YC500_ADS_TO_RAW_SCALE = 1.1f;
+const float YC500_AMPS_PER_RAW_VOLT = 500.0f;
+
+const float LEM_RAW_CENTER_VOLTS = 2.5f;
+const float LEM_ADS_TO_RAW_SCALE = 2.0f;
+const float LEM_WELDING_VOLTS_PER_RAW_VOLT = 750.0f;
+
+const float VOLTS_NOISE_FLOOR = 1.0f;
+const float AMPS_NOISE_FLOOR = 1.0f;
+
+const float AC_DETECT_VOLTS_MIN = 5.0f;
+const float AC_DETECT_AMPS_MIN = 5.0f;
+const float AC_TO_DC_RATIO = 0.35f;
+
+// ----------------------- Timed-slot transmit -----------------------
+
+const uint32_t SLOT_EPOCH_MS = 1000;
+const uint32_t NODE_A_SLOT_MS = 250;
+const uint32_t SLOT_WINDOW_MS = 90;
+
+uint32_t lastTxEpochIndex = UINT32_MAX;
+
+// ----------------------- Runtime state -----------------------
+
+struct SignalStats {
+  float mean;
+  float rmsAc;
+};
+
+struct Measurement {
+  float dcVolts;
+  float acVolts;
+  float dcAmps;
+  float acAmps;
+  float sendVolts;
+  float sendAmps;
+  bool acMode;
+  bool valid;
+};
+
+Measurement latest = {
+  0.0f, 0.0f,
+  0.0f, 0.0f,
+  0.0f, 0.0f,
+  false,
+  false
+};
+
+uint32_t lastSenseMs = 0;
+uint32_t lastOledMs = 0;
+uint32_t lastHeartbeatMs = 0;
+
+// ----------------------- Helpers -----------------------
+
+void VextON() {
+  pinMode(PIN_VEXT, OUTPUT);
+  digitalWrite(PIN_VEXT, LOW);
+}
+
+void oledHardResetPulse() {
+  pinMode(PIN_OLED_RST, OUTPUT);
+  digitalWrite(PIN_OLED_RST, LOW);
+  delay(20);
+  digitalWrite(PIN_OLED_RST, HIGH);
+  delay(20);
+}
+
+float applyDeadband(float value, float floorValue) {
+  if (fabs(value) < floorValue) {
+    return 0.0f;
+  }
+  return value;
+}
+
+float adsCountsToVolts(int16_t counts) {
+  return (float)counts * ADS_VOLTS_PER_COUNT;
+}
+
+float readAdsVolts(Adafruit_ADS1115 &ads, uint8_t channel) {
+  int16_t counts = ads.readADC_SingleEnded(channel);
+  return adsCountsToVolts(counts);
+}
+
+float ampAdsVoltsToAmps(float adsAmpVolts) {
+  return ((adsAmpVolts * YC500_ADS_TO_RAW_SCALE) - YC500_RAW_CENTER_VOLTS) * YC500_AMPS_PER_RAW_VOLT;
+}
+
+float voltAdsVoltsToWeldingVolts(float adsVoltVolts) {
+  return ((adsVoltVolts * LEM_ADS_TO_RAW_SCALE) - LEM_RAW_CENTER_VOLTS) * LEM_WELDING_VOLTS_PER_RAW_VOLT;
+}
+
+SignalStats calculateStats(float samples[], uint16_t count) {
+  SignalStats stats;
+  stats.mean = 0.0f;
+  stats.rmsAc = 0.0f;
+
+  if (count == 0) {
+    return stats;
+  }
+
+  double sum = 0.0;
+  for (uint16_t i = 0; i < count; i++) {
+    sum += samples[i];
+  }
+
+  stats.mean = (float)(sum / count);
+
+  double sumSquares = 0.0;
+  for (uint16_t i = 0; i < count; i++) {
+    double centered = (double)samples[i] - stats.mean;
+    sumSquares += centered * centered;
+  }
+
+  stats.rmsAc = (float)sqrt(sumSquares / count);
+  return stats;
+}
+
+// ----------------------- I2C diagnostic scan -----------------------
+
+void scanI2CBus() {
+  Serial.println("Scanning I2C inside Rev36...");
+
+  byte count = 0;
+
+  for (byte address = 1; address < 127; address++) {
+    Wire.beginTransmission(address);
+    byte error = Wire.endTransmission();
+
+    if (error == 0) {
+      Serial.print("Rev36 found I2C device at 0x");
+      if (address < 16) {
+        Serial.print("0");
+      }
+      Serial.println(address, HEX);
+      count++;
+    }
+  }
+
+  if (count == 0) {
+    Serial.println("Rev36 found no I2C devices");
+  }
+
+  Serial.println("I2C scan complete.");
+  Serial.println();
+}
+
+// ----------------------- Timed slot -----------------------
+
+uint32_t currentEpochIndex() {
+  return millis() / SLOT_EPOCH_MS;
+}
+
+uint32_t currentEpochOffsetMs() {
+  return millis() % SLOT_EPOCH_MS;
+}
+
+bool transmitGateOpen() {
+  uint32_t offset = currentEpochOffsetMs();
+  return offset >= NODE_A_SLOT_MS && offset < (NODE_A_SLOT_MS + SLOT_WINDOW_MS);
+}
+
+// ----------------------- ADS setup / sensing -----------------------
+
+void setupAds() {
+  adsVoltReady = adsVolt.begin(ADS_VOLT_ADDR, &Wire);
+  adsAmpReady  = adsAmp.begin(ADS_AMP_ADDR, &Wire);
+
+  if (adsVoltReady) {
+    adsVolt.setGain(GAIN_ONE);
+    adsVolt.setDataRate(RATE_ADS1115_860SPS);
+  }
+
+  if (adsAmpReady) {
+    adsAmp.setGain(GAIN_ONE);
+    adsAmp.setDataRate(RATE_ADS1115_860SPS);
+  }
+}
+
+Measurement readMeasurement() {
+  Measurement m;
+  m.dcVolts = 0.0f;
+  m.acVolts = 0.0f;
+  m.dcAmps = 0.0f;
+  m.acAmps = 0.0f;
+  m.sendVolts = 0.0f;
+  m.sendAmps = 0.0f;
+  m.acMode = false;
+  m.valid = adsAmpReady && adsVoltReady;
+
+  if (!m.valid) {
+    return m;
+  }
+
+  float voltSamples[SAMPLE_COUNT];
+  float ampSamples[SAMPLE_COUNT];
+
+  for (uint16_t i = 0; i < SAMPLE_COUNT; i++) {
+    float adsVoltVolts = readAdsVolts(adsVolt, ADS_VOLT_CHANNEL);
+    float adsAmpVolts = readAdsVolts(adsAmp, ADS_AMP_CHANNEL);
+
+    voltSamples[i] = voltAdsVoltsToWeldingVolts(adsVoltVolts);
+    ampSamples[i] = ampAdsVoltsToAmps(adsAmpVolts);
+
+    delayMicroseconds(SAMPLE_SPACING_US);
+  }
+
+  SignalStats voltStats = calculateStats(voltSamples, SAMPLE_COUNT);
+  SignalStats ampStats = calculateStats(ampSamples, SAMPLE_COUNT);
+
+  m.dcVolts = applyDeadband(voltStats.mean, VOLTS_NOISE_FLOOR);
+  m.acVolts = applyDeadband(voltStats.rmsAc, VOLTS_NOISE_FLOOR);
+  m.dcAmps = applyDeadband(ampStats.mean, AMPS_NOISE_FLOOR);
+  m.acAmps = applyDeadband(ampStats.rmsAc, AMPS_NOISE_FLOOR);
+
+  bool voltsLookAc = m.acVolts >= AC_DETECT_VOLTS_MIN && m.acVolts > (fabs(m.dcVolts) * AC_TO_DC_RATIO);
+  bool ampsLookAc = m.acAmps >= AC_DETECT_AMPS_MIN && m.acAmps > (fabs(m.dcAmps) * AC_TO_DC_RATIO);
+
+  m.acMode = voltsLookAc || ampsLookAc;
+
+  if (m.acMode) {
+    m.sendVolts = m.acVolts;
+    m.sendAmps = m.acAmps;
+  } else {
+    m.sendVolts = m.dcVolts;
+    m.sendAmps = m.dcAmps;
+  }
+
+  return m;
+}
+
+void maybeSense() {
+  uint32_t now = millis();
+
+  if (now - lastSenseMs < SENSE_INTERVAL_MS) {
+    return;
+  }
+
+  lastSenseMs = now;
+  latest = readMeasurement();
+}
+
+// ----------------------- OLED -----------------------
+
+void drawOLED() {
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_6x12_tf);
+
+  u8g2.drawStr(0, 10, "Waska PN A Rev36");
+
+  char line[32];
+
+  snprintf(line, sizeof(line), "Mode %s", latest.acMode ? "AC" : "DC");
+  u8g2.drawStr(0, 24, line);
+
+  snprintf(line, sizeof(line), "V %.1f  A %.2f", latest.sendVolts, latest.sendAmps);
+  u8g2.drawStr(0, 38, line);
+
+  snprintf(line, sizeof(line), "ADS V:%s A:%s",
+           adsVoltReady ? "OK" : "NO",
+           adsAmpReady ? "OK" : "NO");
+  u8g2.drawStr(0, 52, line);
+
+  snprintf(line, sizeof(line), "LoRa %s", loraOK ? "OK" : "FAIL");
+  u8g2.drawStr(0, 64, line);
+
+  u8g2.sendBuffer();
+}
+
+void maybeOLED() {
+  uint32_t now = millis();
+
+  if (now - lastOledMs < OLED_INTERVAL_MS) {
+    return;
+  }
+
+  lastOledMs = now;
+  drawOLED();
+}
+
+// ----------------------- LoRa packet transmit -----------------------
+
+String legacyRunPacket(const Measurement &m) {
+  String packet = "P,A,RUN,";
+  packet += String(m.sendVolts, 2);
+  packet += ",";
+  packet += String(m.sendAmps, 2);
+  return packet;
+}
+
+String modePacket(const Measurement &m) {
+  String packet = "P,A,MODE,";
+  packet += m.acMode ? "AC" : "DC";
+  packet += ",";
+  packet += String(m.sendVolts, 2);
+  packet += ",";
+  packet += String(m.sendAmps, 2);
+  return packet;
+}
+
+void maybeTransmit() {
+  if (!loraOK) {
+    return;
+  }
+
+  if (!latest.valid) {
+    return;
+  }
+
+  if (!transmitGateOpen()) {
+    return;
+  }
+
+  uint32_t epoch = currentEpochIndex();
+
+  if (lastTxEpochIndex == epoch) {
+    return;
+  }
+
+  String runPacket = legacyRunPacket(latest);
+  String acDcPacket = modePacket(latest);
+
+  int txState1 = lora.transmit(runPacket);
+  delay(8);
+  int txState2 = lora.transmit(acDcPacket);
+
+  Serial.print("TX ");
+  Serial.print(runPacket);
+  Serial.print(" state=");
+  Serial.println(txState1);
+
+  Serial.print("TX ");
+  Serial.print(acDcPacket);
+  Serial.print(" state=");
+  Serial.println(txState2);
+
+  lastTxEpochIndex = epoch;
+}
+
+// ----------------------- Debug -----------------------
+
+void printBootDebug() {
+  Serial.println();
+  Serial.println("Maskwa Connect Power Sender A");
+  Serial.println("Rev.36 Heltec ADS Architecture");
+
+  Serial.print("ADS voltage 0x48: ");
+  Serial.println(adsVoltReady ? "OK" : "MISSING");
+
+  Serial.print("ADS amps 0x49: ");
+  Serial.println(adsAmpReady ? "OK" : "MISSING");
+
+  Serial.print("ADS I2C SDA: GPIO");
+  Serial.println(I2C_SDA_PIN);
+
+  Serial.print("ADS I2C SCL: GPIO");
+  Serial.println(I2C_SCL_PIN);
+
+  Serial.print("LoRa init: ");
+  Serial.println(loraOK ? "OK" : "FAIL");
+
+  Serial.println("Packets:");
+  Serial.println("P,A,RUN,<volts>,<amps>");
+  Serial.println("P,A,MODE,<AC/DC>,<volts>,<amps>");
+  Serial.println("Timed slot: Node A local 250ms window");
+  Serial.println();
+}
+
+void maybeHeartbeat() {
+  uint32_t now = millis();
+
+  if (now - lastHeartbeatMs < HEARTBEAT_INTERVAL_MS) {
+    return;
+  }
+
+  lastHeartbeatMs = now;
+
+  Serial.print("HB Rev36 mode=");
+  Serial.print(latest.acMode ? "AC" : "DC");
+
+  Serial.print(" sendVolts=");
+  Serial.print(latest.sendVolts, 2);
+
+  Serial.print(" sendAmps=");
+  Serial.print(latest.sendAmps, 2);
+
+  Serial.print(" dcVolts=");
+  Serial.print(latest.dcVolts, 2);
+
+  Serial.print(" acVolts=");
+  Serial.print(latest.acVolts, 2);
+
+  Serial.print(" dcAmps=");
+  Serial.print(latest.dcAmps, 2);
+
+  Serial.print(" acAmps=");
+  Serial.print(latest.acAmps, 2);
+
+  Serial.print(" window=");
+  Serial.print(transmitGateOpen() ? "OPEN" : "CLOSED");
+
+  Serial.print(" epoch=");
+  Serial.print(currentEpochIndex());
+
+  Serial.print(" offset_ms=");
+  Serial.print(currentEpochOffsetMs());
+
+  Serial.print(" ADS48=");
+  Serial.print(adsVoltReady ? "OK" : "MISSING");
+
+  Serial.print(" ADS49=");
+  Serial.print(adsAmpReady ? "OK" : "MISSING");
+
+  Serial.print(" LoRa=");
+  Serial.println(loraOK ? "OK" : "FAIL");
+}
+
+// ----------------------- Setup / loop -----------------------
+
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+
+  Serial.println();
+  Serial.println("BOOT: Waska PN A Rev36 Heltec ADS");
+
+  VextON();
+  delay(50);
+  oledHardResetPulse();
+  u8g2.begin();
+
+  drawOLED();
+
+  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+  Wire.setClock(100000);
+  Wire.setTimeOut(100);
+
+  scanI2CBus();
+
+  delay(500);
+  setupAds();
+
+  SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_NSS);
+
+  int state = lora.begin(915.0);
+  if (state == RADIOLIB_ERR_NONE) {
+    loraOK = true;
+  } else {
+    loraOK = false;
+  }
+
+  printBootDebug();
+
+  lastSenseMs = millis() - SENSE_INTERVAL_MS;
+  lastOledMs = millis() - OLED_INTERVAL_MS;
+  lastHeartbeatMs = millis() - HEARTBEAT_INTERVAL_MS;
+}
+
+void loop() {
+  maybeSense();
+  maybeTransmit();
+  maybeOLED();
+  maybeHeartbeat();
+}
