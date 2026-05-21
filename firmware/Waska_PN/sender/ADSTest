@@ -1,0 +1,45 @@
+#include <Wire.h>
+
+#define SDA_PIN 41
+#define SCL_PIN 42
+
+void setup() {
+  Serial.begin(115200);
+  delay(2000);
+
+  Serial.println();
+  Serial.println("ONE ADS1115 TEST AFTER SOLDER");
+  Serial.println("SDA = GPIO41");
+  Serial.println("SCL = GPIO42");
+  Serial.println("ADDR = GND, expected 0x48");
+
+  Wire.begin(SDA_PIN, SCL_PIN);
+  Wire.setTimeOut(50);
+}
+
+void loop() {
+  byte count = 0;
+
+  Serial.println("Scanning...");
+
+  for (byte address = 1; address < 127; address++) {
+    Wire.beginTransmission(address);
+    byte error = Wire.endTransmission();
+
+    if (error == 0) {
+      Serial.print("I2C device found at 0x");
+      if (address < 16) Serial.print("0");
+      Serial.println(address, HEX);
+      count++;
+    }
+  }
+
+  if (count == 0) {
+    Serial.println("No I2C devices found");
+  }
+
+  Serial.println("Done.");
+  Serial.println();
+
+  delay(3000);
+}
